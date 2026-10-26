@@ -1,163 +1,170 @@
 # AI Customer Support Agent — Phase 1
 
-A local infrastructure playground for learning AI engineering and distributed systems.
-Phase 1 provides running services, connectivity probes, and placeholder interfaces.
-It does **not** implement chat, tool calls, orders, refunds, approvals, authentication,
-persistence of conversations, durable execution, queues, or SSE. Those come later.
+A local infrastructure project for learning AI engineering and distributed systems.
+The backend is a **modular monolith**: one FastAPI application, one Python package,
+and one backend container, with clear feature boundaries inside it.
+
+Phase 1 provides connectivity checks and placeholder interfaces. It does not
+implement chat, tool calls, order/refund logic, approval workflows, authentication,
+conversation persistence, SSE, queues, or durable execution.
 
 ## Architecture
 
-| Component | Responsibility now | Host URL / port |
+| Component | Responsibility | Default host address |
 | --- | --- | --- |
-| customer-web | Placeholder customer chat and gateway indicator | http://localhost:3000 |
-| operator-web | Placeholder approvals and gateway indicator | http://localhost:3001 |
-| gateway | Browser API, CORS, concurrent downstream health checks | http://localhost:8000 |
-| agent | Database readiness and optional Ollama connectivity | http://localhost:8001 |
-| orders | Service skeleton with health endpoint | http://localhost:8002 |
-| refunds | Service skeleton with health endpoint | http://localhost:8003 |
-| approvals | Service skeleton with health endpoint | http://localhost:8004 |
-| worker | Idle process that checks PostgreSQL and retries failures | No HTTP port |
-| postgres | Persistent PostgreSQL 17 database | localhost:5432 |
-| Ollama | Native macOS model server, outside Compose | http://localhost:11434 |
+| customer-web | Placeholder chat and backend connectivity indicator | http://localhost:3000 |
+| operator-web | Placeholder approvals and backend connectivity indicator | http://localhost:3001 |
+| backend | FastAPI, health, PostgreSQL readiness, Ollama diagnostics | http://localhost:8000 |
+| postgres | PostgreSQL 17 with a persistent named volume | localhost:5432 |
+| Ollama | Native macOS model server; outside Docker | http://localhost:11434 |
 
-Compose creates one default bridge network. All five APIs listen on port **8000
-inside their own container**; published host ports differ. Gateway calls
-`http://orders:8000`, `http://agent:8000`, etc. Compose DNS resolves these service
-names. Inside a container, `localhost` means that container, not your Mac.
-The browser runs on your Mac and calls `http://localhost:8000`.
+Compose starts **four containers** on its default bridge network. There is no
+separate gateway or worker. The browser calls the backend directly using
+`VITE_API_BASE_URL`. Within the backend, modules will communicate through Python
+service functions, not HTTP calls to themselves.
 
-The agent and worker reach `postgres:5432` using asyncpg. The agent reaches native
-Ollama through `host.docker.internal`, Docker Desktop's hostname for the Mac.
-Ollama runs natively to use Apple Silicon GPU acceleration; it is never installed
-in a container. See the [Ollama FAQ](https://docs.ollama.com/faq).
+Inside a container, `localhost` means that container. The backend reaches the
+database at `postgres:5432` using Compose DNS. It reaches native macOS Ollama at
+`host.docker.internal:11434`, Docker Desktop's address for the Mac. Ollama runs
+natively for Apple Silicon GPU acceleration; it is not installed in Docker.
+See the [official Ollama FAQ](https://docs.ollama.com/faq).
 
-Each service owns its entry point, requirements, and Dockerfile. The common Python
-package contains only logging and a short-lived `SELECT 1` connectivity helper.
-Future services will own their schemas/tables and migrations. They should call
-one another's HTTP APIs rather than access another service's data directly.
-There are no business tables or migrations in Phase 1.
+## Backend organization and growth
 
-## Prerequisites
+- `app/main.py`: application factory, CORS, logging, router registration.
+- `app/core`: configuration read from environment at application construction and logging setup.
+- `app/infrastructure`: asyncpg connectivity helper; later, shared database infrastructure.
+- `app/integrations`: clients for external services, currently Ollama.
+- `app/modules/system`: HTTP diagnostics, response schemas, and infrastructure checks.
+- `app/modules/agent`, `orders`, `refunds`, `approvals`: feature boundaries with
+  responsibility docstrings only until their use cases are implemented.
 
-- Docker Desktop for Apple Silicon, started and ready (`docker info` should work).
-- Git. Python 3.12+ for the optional unit tests; any modern Python 3 for smoke tests.
-- Node.js 22.12+ and npm only if developing/building the UIs outside Docker.
-- Optional: [Ollama for macOS](https://ollama.com/download/mac).
+Add `router.py`, `schemas.py`, `service.py`, and `repository.py` to a feature only
+when needed. Routers handle HTTP, services implement use cases, and repositories
+own database access. A feature calls another feature's service functions rather
+than importing its repository or accessing its tables. Infrastructure and external
+clients must not import business modules. Avoid putting business logic into `core`.
 
-Docker builds use native multi-architecture Python 3.12, Node 22, and PostgreSQL
-17 images; no amd64 emulation is forced. Frontend lockfiles are committed and
-images install with `npm ci`.
+The installable `support-backend` package is defined in `backend/pyproject.toml`.
+Test dependencies are its `test` extra; root `requirements-dev.txt` installs that
+extra without duplicating dependency versions. There are no business tables or
+migrations in Phase 1. PostgreSQL checks use short-lived asyncpg connections and
+`SELECT 1`, always closing successful connections even if the query fails.
 
-## Start
+There is no background worker or polling loop. Future durable execution needs an
+explicit persistence, recovery, and scheduling design. Ordinary FastAPI background
+tasks alone would not provide durable execution across restarts. That design is
+outside this phase.
+
+## Prerequisites and startup
+
+- Docker Desktop for Apple Silicon, running (`docker info` must work).
+- Optional native tools: Python 3.12+ for unit tests; Node 22.12+ and npm for UI builds.
+- Python 3 for the standard-library smoke script.
+- Optional [Ollama for macOS](https://ollama.com/download/mac); no model is required.
 
 From the repository root:
 
 ```bash
-cp .env.example .env
+cp .env.example .env  # Only on first setup; preserve an existing .env
 docker compose up --build
 ```
 
-Defaults also allow startup without `.env`. These are local development
-credentials, not production secrets. `.env` is ignored by Git. If you customize
-PostgreSQL credentials, update `DATABASE_URL` to match (URL-encode special
-characters in the URL). Database initialization credentials apply only to a new
-volume; editing `.env` does not change existing database passwords.
+Defaults also permit startup without `.env`. These credentials are for local
+development. `.env` is ignored by Git. If changing database credentials, also
+update `DATABASE_URL` with matching URL-encoded credentials. Existing database
+volumes retain their original users/passwords; changing environment variables does
+not change credentials already stored by PostgreSQL.
 
-For detached mode and a bounded readiness wait:
+For background operation:
 
 ```bash
-docker compose up --build -d --wait --wait-timeout 120
+docker compose up --build -d --wait --wait-timeout 120 --remove-orphans
 docker compose ps
 ```
 
-All nine containers have health checks and `unless-stopped` restart policies.
-Agent and worker wait for initial PostgreSQL health. The worker keeps checking
-and retrying if PostgreSQL later goes away. No service depends on Ollama starting.
-API `/health` is process liveness; agent `/ready` is database readiness and returns
-503 during a database outage. Docker API health checks deliberately use liveness.
-The worker health check requires a recent successful database probe from its actual
-main loop, not merely a separate process that can reach the database.
+The backend has one Uvicorn application process with development reload (the
+reload watcher is not another application worker). All four containers have health
+checks and `unless-stopped` restart policies. Initial backend startup waits for
+PostgreSQL health; later outages cause `/ready` to return 503 while `/health`
+continues responding. Ollama is optional and never blocks startup or readiness.
 
-Open the two UIs using the URLs above. Their gateway indicators poll every ten
-seconds, time out after four seconds, and recover automatically. The indicator
-checks the gateway itself; `/api/system/status` checks downstream connectivity.
+The images support native ARM64 builds. Frontend images use `npm ci` and committed
+lockfiles. Python source and frontend source/config are mounted for development;
+container `node_modules` remains in the image to avoid host/container conflicts.
+Rebuild after dependency changes. Recreate containers after environment changes.
 
-## Optional Ollama setup
+## API contracts
 
-Install and open the Ollama macOS application, or start the CLI server:
+All endpoints live on backend port 8000. No legacy service ports or proxies remain.
 
-```bash
-ollama serve
-```
+| Endpoint | Response and meaning |
+| --- | --- |
+| `GET /health` | `{"service":"backend","status":"healthy"}`; process liveness only. |
+| `GET /ready` | `service`, `status` (`ready`/`not_ready`), `database` (`connected`/`unavailable`); HTTP 200 or 503 following `SELECT 1`. |
+| `GET /integrations/ollama/health` | `reachable`, `available_models`, `configured_model`, `model_installed`, `error`; diagnostics return HTTP 200 even when disconnected. |
+| `GET /api/system/status` | `status` (`healthy`/`degraded`), `database` (`connected`/`unavailable`), `ollama` (the same diagnostics object). HTTP 200; overall health depends only on PostgreSQL. |
 
-Do not start a second server if the app is already serving port 11434. In another
-terminal, optionally download the configured model:
+Status checks query PostgreSQL and Ollama concurrently with bounded timeouts.
+Ollama offline or a missing model does not degrade infrastructure readiness.
+The UIs poll `/health` every ten seconds and display “Backend: connected” when its
+contract matches; that indicator is liveness, not full dependency readiness.
+
+## Native Ollama
+
+Install and open the macOS application, or run `ollama serve`. Do not launch a
+second server if the app already occupies port 11434. Model download is optional:
 
 ```bash
 ollama pull qwen3:4b
 ollama list
 curl http://localhost:11434/api/tags
-curl http://localhost:8001/integrations/ollama/health
+curl http://localhost:8000/integrations/ollama/health
 ```
 
-The agent reports reachability, installed model names, configured model, whether
-that model is installed, and an error when unavailable. It never generates a
-response. An empty model list is valid: **no model download is required for tests**.
-
-If the host request succeeds but the container request fails, check the server's
-bind address. For the macOS app, set this and then fully quit/reopen Ollama:
+If host requests work but Docker requests fail, adjust Ollama's bind address.
+For the macOS app, run the following, then fully quit and reopen Ollama:
 
 ```bash
 launchctl setenv OLLAMA_HOST "0.0.0.0:11434"
 ```
 
-For CLI-only use, stop the previous server and run:
+For a CLI server, stop the old server and run:
 
 ```bash
 OLLAMA_HOST=0.0.0.0:11434 ollama serve
 ```
 
-Binding all interfaces can expose this unauthenticated local API on your network;
-use a trusted development network and appropriate firewall settings. The app
-setting can be undone with `launchctl unsetenv OLLAMA_HOST` followed by a restart.
-These settings follow the [official Ollama instructions](https://docs.ollama.com/faq#setting-environment-variables-on-mac).
+Binding all interfaces can expose this unauthenticated API on your network; use
+a trusted network and firewall settings. Undo the app setting with
+`launchctl unsetenv OLLAMA_HOST` and restart the app. See
+[Ollama's macOS configuration instructions](https://docs.ollama.com/faq#setting-environment-variables-on-mac).
 
-## Health and smoke tests
-
-With the stack running:
+## Tests and health checks
 
 ```bash
 curl http://localhost:8000/health
+curl http://localhost:8000/ready
 curl http://localhost:8000/api/system/status
-curl http://localhost:8001/ready
-curl http://localhost:8001/integrations/ollama/health
 python3 scripts/smoke.py
 ```
 
-The standard-library smoke script waits up to 60 seconds, checks all five APIs,
-gateway-to-service communication, agent database readiness, the actual worker's
-successful database heartbeat, both frontend HTML pages, and the Ollama response
-contract. It exits nonzero on failure. To require live Ollama connectivity:
+Smoke tests check backend liveness, database readiness, system diagnostics, both
+frontend HTML responses, and the Ollama contract. They allow up to 60 seconds for
+startup and exit nonzero on failure. Add `--ollama online` to require reachable
+Ollama, or `--operator-port 13001` when using that local port override.
 
-```bash
-python3 scripts/smoke.py --ollama online
-```
-
-To verify startup with Ollama forcibly unreachable, without stopping your native
-Ollama server or deleting database data:
+Force Ollama offline without stopping your native server or deleting database data:
 
 ```bash
 docker compose down
-docker compose -f compose.yaml -f scripts/compose.ollama-offline.yaml up --build -d --wait --wait-timeout 120
+docker compose -f compose.yaml -f scripts/compose.ollama-offline.yaml up -d --wait --wait-timeout 120
 python3 scripts/smoke.py --ollama offline
-# Restore the normal agent configuration afterward:
+# Restore the normal backend configuration:
 docker compose up -d --wait --wait-timeout 120
 ```
 
-Unit tests use HTTP mocks and database doubles, so they need neither Docker nor a
-model download. They cover healthy APIs, CORS, partial downstream failures,
-timeouts, invalid Ollama responses, database readiness, connection cleanup, and
-worker retry/recovery/shutdown:
+Unit tests need no Docker or Ollama:
 
 ```bash
 python3.12 -m venv .venv
@@ -166,90 +173,79 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-Build each UI locally:
+They cover liveness, CORS, database failure/recovery and cleanup, optional Ollama,
+malformed responses, timeouts, and aggregate diagnostics. Build each UI with:
 
 ```bash
 (cd apps/customer-web && npm ci && npm run build)
 (cd apps/operator-web && npm ci && npm run build)
 ```
 
-## Development and logs
+To run only the backend on the host after installing dependencies:
 
 ```bash
-docker compose logs -f gateway agent worker
+DATABASE_URL=postgresql://support:support_dev_password@localhost:5432/support \
+OLLAMA_BASE_URL=http://localhost:11434 \
+uvicorn app.main:app --reload --port 8000
+```
+
+Use the configured host PostgreSQL port if overridden, and stop the containerized
+backend to free port 8000. Compose reads `.env`; standalone Python does not load
+it automatically. Host processes cannot resolve Compose's `postgres` hostname.
+
+## Logs, stopping, and data preservation
+
+```bash
+docker compose logs -f backend
 docker compose logs --tail=100 postgres
-docker compose restart worker
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"'
+docker compose stop          # Keep containers and volume
+docker compose start         # Resume existing containers
+docker compose down          # Remove containers/network; preserve volume
+docker compose up -d         # Reuse preserved PostgreSQL data
 ```
 
-Python APIs use Uvicorn reload and source mounts. Vite binds to `0.0.0.0`, with
-only source/config files mounted. Container `node_modules` stays in the image,
-so host dependencies cannot overwrite it. After dependency or package manifest
-changes, update the relevant lockfile and rebuild. Worker source changes require
-`docker compose restart worker`; it intentionally has no reload supervisor.
-Environment changes require `docker compose up -d` to recreate affected containers.
-
-For a single API outside Docker, install its requirements from its own directory,
-then run Uvicorn (use a free port):
-
-```bash
-cd services/orders
-python -m pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8002
-```
-
-When running agent/worker on the host, explicitly set `DATABASE_URL` to use
-`localhost:5432`; host processes cannot resolve Compose's `postgres` name.
-Similarly, host-run gateway URLs must use published localhost service ports.
-Compose reads root `.env`; standalone Python processes do not load it automatically.
-
-## Stop, preserve, or reset data
-
-```bash
-docker compose stop       # Stop processes; keep containers and data
-docker compose start      # Resume existing containers
-docker compose down       # Remove containers/network; preserve named volume
-docker compose up -d      # Recreate containers using the same data
-```
-
-PostgreSQL stores data in the named `postgres-data` volume, mounted at
-`/var/lib/postgresql/data`. Container restarts/recreation do not erase it.
-To intentionally delete **all project database data** and initialize again:
+The project name remains `ai-support-agent`, and PostgreSQL retains the
+`postgres-data` named volume at `/var/lib/postgresql/data`. To intentionally erase
+**all project database data** and initialize again:
 
 ```bash
 docker compose down --volumes
 docker compose up --build -d
 ```
 
-## Troubleshooting on macOS
+When upgrading from the microservice version, preserve `.env` credentials and
+port overrides, rename `VITE_GATEWAY_URL` to `VITE_API_BASE_URL`, and remove the
+four internal service URLs and `WORKER_CHECK_INTERVAL`. Then run
+`docker compose up --build -d --wait --remove-orphans`. This removes obsolete
+service containers without deleting the PostgreSQL volume. Frontend health checks
+must use the new backend contract; ports 8001–8004 are no longer exposed.
 
-- **Cannot connect to Docker daemon:** launch Docker Desktop and wait for
-  `docker info` to succeed. Check `docker context ls` if the wrong daemon is selected.
-- **PostgreSQL port 5432 already in use:** set `POSTGRES_PORT=5433` in `.env`.
-  This changes only the Mac-facing port; keep `DATABASE_URL` using `postgres:5432`
-  inside Docker. Host SQL clients then use localhost:5433.
-- **Operator port 3001 already in use:** set `OPERATOR_WEB_PORT=13001` and add
-  `http://localhost:13001` to `CORS_ORIGINS` in `.env`. Open that port and run
-  smoke tests with `--operator-port 13001`. The container still listens on 3001.
-- **Port already allocated:** stop the conflicting local process or change the
-  host-side published port. If gateway/UI ports change, also update
-  `VITE_GATEWAY_URL` and `CORS_ORIGINS`.
-- **Gateway degraded:** inspect `/api/system/status` and the relevant service logs.
-  Internal URLs use service names and container port 8000, never host port 8002.
-- **Ollama disconnected:** compare host `/api/tags` with the container probe:
-  `docker compose exec agent python -c "import urllib.request; print(urllib.request.urlopen('http://host.docker.internal:11434/api/tags', timeout=3).read().decode())"`.
-  Check the Ollama bind address, firewall, VPN, and Docker Desktop networking.
-- **Database auth failure after editing `.env`:** the existing volume retains old
-  credentials. Restore matching settings, change the password through PostgreSQL,
-  or explicitly reset disposable data using the destructive command above.
-- **UI indicator disconnected:** use browser developer tools to check the gateway
-  URL and CORS origin. A browser cannot resolve `gateway` or `orders` as hostnames.
-- **Source changes not appearing:** check Docker Desktop file-sharing access to
-  this repository. Rebuild for dependency changes; restart the worker for edits.
+## Troubleshooting and local overrides
+
+- **Docker unavailable:** start Docker Desktop; check `docker info` and `docker context ls`.
+- **PostgreSQL port occupied:** set `POSTGRES_PORT=15432` in `.env`. Only host clients
+  use this port; Docker's `DATABASE_URL` must still use `postgres:5432`.
+- **Operator port occupied:** set `OPERATOR_WEB_PORT=13001`, add
+  `http://localhost:13001` to `CORS_ORIGINS`, open that URL, and pass
+  `--operator-port 13001` to smoke tests. The container still listens on 3001.
+- **UI disconnected:** check the browser's API URL and CORS origin. The browser
+  uses localhost:8000, not a Docker hostname.
+- **Database unavailable:** inspect `/ready` and PostgreSQL logs. Verify credentials
+  match the existing volume; do not reset non-disposable data to fix configuration.
+- **Ollama disconnected:** check host `/api/tags`, bind address, firewall, VPN, and
+  Docker Desktop networking. Probe from the backend with:
+  `docker compose exec backend python -c "import urllib.request; print(urllib.request.urlopen('http://host.docker.internal:11434/api/tags', timeout=3).read().decode())"`.
+- **Hot reload not working:** check Docker Desktop file sharing for this repository.
+  Dependency changes require an image rebuild.
+
+This machine's ignored `.env` preserves PostgreSQL port **15432**, operator port
+**13001**, and its corresponding CORS origin. Committed defaults remain 5432 and
+3001. Neither existing host services nor their data need to be stopped or changed.
 
 ## Repository tree
 
-Generated dependencies, caches, build output, `.git`, and `.env` are omitted.
+Generated dependencies, build output, caches, `.git`, and `.env` are omitted.
 
 ```text
 ai-support-agent/
@@ -278,62 +274,44 @@ ai-support-agent/
 │       ├── package.json
 │       ├── tsconfig.json
 │       └── vite.config.ts
+├── backend/
+│   ├── app/
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── config.py
+│   │   │   └── logging.py
+│   │   ├── infrastructure/
+│   │   │   ├── __init__.py
+│   │   │   └── database.py
+│   │   ├── integrations/
+│   │   │   ├── __init__.py
+│   │   │   └── ollama.py
+│   │   ├── modules/
+│   │   │   ├── agent/
+│   │   │   │   └── __init__.py
+│   │   │   ├── approvals/
+│   │   │   │   └── __init__.py
+│   │   │   ├── orders/
+│   │   │   │   └── __init__.py
+│   │   │   ├── refunds/
+│   │   │   │   └── __init__.py
+│   │   │   ├── system/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── router.py
+│   │   │   │   ├── schemas.py
+│   │   │   │   └── service.py
+│   │   │   └── __init__.py
+│   │   ├── __init__.py
+│   │   └── main.py
+│   ├── Dockerfile
+│   └── pyproject.toml
 ├── infra/
 │   └── postgres/
 │       └── README.md
-├── packages/
-│   └── python-common/
-│       ├── src/
-│       │   └── support_common/
-│       │       ├── __init__.py
-│       │       ├── database.py
-│       │       └── logging.py
-│       └── pyproject.toml
 ├── scripts/
 │   ├── compose.ollama-offline.yaml
 │   └── smoke.py
-├── services/
-│   ├── agent/
-│   │   ├── app/
-│   │   │   ├── __init__.py
-│   │   │   ├── integrations.py
-│   │   │   └── main.py
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   ├── approvals/
-│   │   ├── app/
-│   │   │   ├── __init__.py
-│   │   │   └── main.py
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   ├── gateway/
-│   │   ├── app/
-│   │   │   ├── __init__.py
-│   │   │   ├── connectivity.py
-│   │   │   └── main.py
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   ├── orders/
-│   │   ├── app/
-│   │   │   ├── __init__.py
-│   │   │   └── main.py
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   ├── refunds/
-│   │   ├── app/
-│   │   │   ├── __init__.py
-│   │   │   └── main.py
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   └── worker/
-│       ├── app/
-│       │   ├── __init__.py
-│       │   ├── healthcheck.py
-│       │   └── main.py
-│       ├── Dockerfile
-│       └── requirements.txt
 ├── tests/
-│   ├── conftest.py
 │   └── test_infrastructure.py
 ├── .dockerignore
 ├── .env.example
@@ -344,26 +322,22 @@ ai-support-agent/
 └── requirements-dev.txt
 ```
 
-## Validation performed
+## Monolith validation results
 
-The implementation was validated with Python 3.12 on Apple Silicon and Docker
-Desktop. All 23 Pytest cases passed, both TypeScript/Vite production builds passed,
-and all nine containers reached healthy status. Browser checks confirmed both UIs
-rendered and displayed a connected gateway, with no captured console errors.
+Validated after this refactor on Apple Silicon with Python 3.12 and Docker Desktop:
 
-Live smoke tests passed with native Ollama reachable and with Ollama deliberately
-unreachable via the override file. The configured `qwen3:4b` model was absent and
-correctly reported as not installed; no model was downloaded. PostgreSQL shutdown
-caused agent readiness to return 503 and the worker to log retries. SIGTERM produced
-the worker's graceful shutdown log. A disposable probe row survived `compose down`
-and container recreation; its test table was then dropped.
+- 19 updated Pytest cases passed; one upstream Starlette/AnyIO deprecation warning.
+- Both TypeScript/Vite production builds passed.
+- Exactly four Compose containers reached healthy status; obsolete service
+  containers were removed with `--remove-orphans`.
+- Live smoke tests passed with native Ollama online and with Ollama forced offline.
+- Stopping PostgreSQL returned HTTP 503 from `/ready` and degraded system status,
+  while backend liveness continued to return healthy. Readiness recovered on restart.
+- A disposable probe row survived the architecture migration and full container
+  recreation; its test table was removed afterward.
+- Both browser UIs displayed “Backend: connected” with no captured console warnings
+  or errors. Existing host port overrides remained in effect.
 
-On the validation machine, existing processes occupied the requested host ports.
-The ignored local `.env` uses `POSTGRES_PORT=15432`, `OPERATOR_WEB_PORT=13001`, and
-includes `http://localhost:13001` in CORS. Use the operator UI at
-http://localhost:13001 and run `python3 scripts/smoke.py --operator-port 13001`
-with that local configuration. Committed defaults remain 5432 and 3001.
-
-The test suite reports one upstream Starlette/AnyIO deprecation warning; it does
-not fail tests. Production deployment, security hardening, and Phase 2 business
-features are outside this development infrastructure phase.
+Native Ollama was reachable but `qwen3:4b` was not installed, correctly reported
+without failing infrastructure checks. No model was downloaded. Normal Ollama
+configuration was restored and the four-container stack was left running.

@@ -1,86 +1,102 @@
-import asyncio
-import importlib
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_app import integrations
-from agent_app import main as agent
-from gateway_app import connectivity
-from gateway_app import main as gateway
-from worker_app import main as worker
-from support_common import database
+from app.core.config import Settings
+from app.infrastructure import database
+from app.integrations import ollama
+from app.main import create_app
+from app.modules.system import service
 
 
-@pytest.mark.parametrize("name", ["gateway", "agent", "orders", "refunds", "approvals"])
-def test_health(name):
-    app = importlib.import_module(f"{name}_app.main").app
-    with TestClient(app) as client:
-        response = client.get("/health")
+@pytest.fixture
+def settings():
+    return Settings(database_url="postgresql://test-only", ollama_model="qwen3:4b")
+
+
+@pytest.fixture
+def client(settings):
+    with TestClient(create_app(settings)) as client:
+        yield client
+
+
+def test_health_independent_of_dependencies(monkeypatch, client):
+    probe = AsyncMock(side_effect=AssertionError("Liveness must not query dependencies"))
+    monkeypatch.setattr(service, "check_database", probe)
+    monkeypatch.setattr(service, "ollama_health", probe)
+    response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"service": name, "status": "healthy"}
+    assert response.json() == {"service": "backend", "status": "healthy"}
+    probe.assert_not_awaited()
 
 
 @pytest.mark.parametrize("origin", ["http://localhost:3000", "http://localhost:3001"])
-def test_gateway_cors(origin):
-    with TestClient(gateway.app) as client:
-        response = client.get("/health", headers={"Origin": origin})
+def test_cors(client, origin):
+    response = client.get("/health", headers={"Origin": origin})
     assert response.headers["access-control-allow-origin"] == origin
 
 
-def test_unlisted_origin_not_allowed():
-    with TestClient(gateway.app) as client:
-        response = client.get("/health", headers={"Origin": "https://example.com"})
+def test_unlisted_origin_not_allowed(client):
+    response = client.get("/health", headers={"Origin": "https://example.com"})
     assert "access-control-allow-origin" not in response.headers
 
 
-@pytest.mark.parametrize("offline", [False, True])
-def test_agent_readiness(monkeypatch, offline):
-    probe = AsyncMock(side_effect=OSError("secret-password") if offline else None)
-    monkeypatch.setattr(agent, "check_database", probe)
-    with TestClient(agent.app) as client:
-        response = client.get("/ready")
-        assert client.get("/health").status_code == 200
-    assert response.status_code == (503 if offline else 200)
-    assert response.json()["database"] == ("unavailable" if offline else "connected")
-    assert "secret-password" not in response.text
+def test_configured_cors_origin(monkeypatch):
+    monkeypatch.setenv("CORS_ORIGINS", " http://localhost:13001, ")
+    settings = Settings.from_env()
+    assert settings.cors_origins == ("http://localhost:13001",)
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/health", headers={"Origin": "http://localhost:13001"})
+    assert response.headers["access-control-allow-origin"] == "http://localhost:13001"
 
 
-def mock_http(monkeypatch, module, handler):
+def test_readiness_failure_and_recovery(monkeypatch, client, settings, caplog):
+    probe = AsyncMock(side_effect=[OSError("secret-password"), None])
+    monkeypatch.setattr(service, "check_database", probe)
+    failed = client.get("/ready")
+    assert failed.status_code == 503
+    assert failed.json() == {"service": "backend", "status": "not_ready", "database": "unavailable"}
+    assert "secret-password" not in failed.text + caplog.text
+    assert client.get("/health").status_code == 200
+    recovered = client.get("/ready")
+    assert recovered.status_code == 200
+    assert recovered.json()["database"] == "connected"
+    probe.assert_awaited_with(settings.database_url)
+
+
+def mock_http(monkeypatch, handler):
     original = httpx.AsyncClient
-    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: original(
-        transport=httpx.MockTransport(handler), **kwargs
+    def factory(**kwargs):
+        assert kwargs["timeout"] == 3
+        return original(transport=httpx.MockTransport(handler), **kwargs)
+    monkeypatch.setattr(ollama.httpx, "AsyncClient", factory)
+
+
+@pytest.mark.parametrize("db_online", [True, False])
+@pytest.mark.parametrize("ollama_online", [True, False])
+def test_system_diagnostics(monkeypatch, client, db_online, ollama_online):
+    monkeypatch.setattr(service, "check_database", AsyncMock(
+        side_effect=None if db_online else OSError("unavailable")
     ))
-
-
-@pytest.mark.parametrize("failure", [None, "offline", "timeout", "http", "invalid"])
-def test_gateway_aggregates_partial_failures(monkeypatch, failure):
     def handler(request):
-        name = request.url.host
-        if name == "orders" and failure:
-            if failure == "offline":
-                raise httpx.ConnectError("unavailable", request=request)
-            if failure == "timeout":
-                raise httpx.ReadTimeout("timed out", request=request)
-            if failure == "http":
-                return httpx.Response(503)
-            return httpx.Response(200, json={"unexpected": True})
-        return httpx.Response(200, json={"service": name, "status": "healthy"})
-    mock_http(monkeypatch, connectivity, handler)
-    with TestClient(gateway.app) as client:
-        response = client.get("/api/system/status")
+        if not ollama_online:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, json={"models": []})
+    mock_http(monkeypatch, handler)
+    response = client.get("/api/system/status")
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == ("degraded" if failure else "healthy")
-    assert body["services"]["orders"]["reachable"] is (failure is None)
-    assert all(body["services"][name]["reachable"] for name in ("agent", "refunds", "approvals"))
+    assert set(body) == {"status", "database", "ollama"}
+    assert body["status"] == ("healthy" if db_online else "degraded")
+    assert body["database"] == ("connected" if db_online else "unavailable")
+    assert body["ollama"]["reachable"] == ollama_online
 
 
-@pytest.mark.parametrize("case", ["installed", "missing", "offline", "timeout", "invalid", "http"])
-def test_ollama_optional(monkeypatch, case):
-    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:4b")
+@pytest.mark.parametrize("case", ["installed", "missing", "offline", "timeout", "invalid", "invalid_json", "http"])
+def test_ollama_optional(monkeypatch, client, case):
+    monkeypatch.setattr(service, "check_database", AsyncMock())
     def handler(request):
         assert request.url.path == "/api/tags"
         if case == "offline":
@@ -89,47 +105,37 @@ def test_ollama_optional(monkeypatch, case):
             raise httpx.ReadTimeout("timeout", request=request)
         if case == "invalid":
             return httpx.Response(200, json={"models": [None]})
+        if case == "invalid_json":
+            return httpx.Response(200, text="not JSON")
         if case == "http":
             return httpx.Response(500)
         return httpx.Response(200, json={"models": [{"name": "qwen3:4b"}] if case == "installed" else []})
-    mock_http(monkeypatch, integrations, handler)
-    with TestClient(agent.app) as client:
-        body = client.get("/integrations/ollama/health").json()
-        assert client.get("/health").status_code == 200
+    mock_http(monkeypatch, handler)
+    response = client.get("/integrations/ollama/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 200
     assert body["reachable"] is (case in ("installed", "missing"))
     assert body["model_installed"] is (case == "installed")
     assert body["configured_model"] == "qwen3:4b"
-    if not body["reachable"]:
-        assert body["error"]
+    assert body["available_models"] == (["qwen3:4b"] if case == "installed" else [])
+    assert bool(body["error"]) is (case not in ("installed", "missing"))
 
 
-async def test_database_closes_connection_on_query_failure(monkeypatch):
+@pytest.mark.parametrize("query_fails", [True, False])
+async def test_database_closes_connection(monkeypatch, query_fails):
     connection = AsyncMock()
-    connection.fetchval.side_effect = OSError("query failed")
+    connection.fetchval.return_value = 1
+    if query_fails:
+        connection.fetchval.side_effect = OSError("query failed")
     connect = AsyncMock(return_value=connection)
     monkeypatch.setattr(database.asyncpg, "connect", connect)
-    monkeypatch.setenv("DATABASE_URL", "postgresql://example")
-    with pytest.raises(OSError):
-        await database.check_database()
+    if query_fails:
+        with pytest.raises(OSError):
+            await database.check_database("postgresql://example")
+    else:
+        await database.check_database("postgresql://example")
+    connect.assert_awaited_once_with("postgresql://example", timeout=3, command_timeout=3)
     connection.fetchval.assert_awaited_once_with("SELECT 1")
     connection.close.assert_awaited_once()
-
-
-async def test_worker_retries_recovers_and_stops(monkeypatch, tmp_path):
-    heartbeat = tmp_path / "heartbeat"
-    monkeypatch.setattr(worker, "HEARTBEAT", heartbeat)
-    monkeypatch.setenv("WORKER_CHECK_INTERVAL", "0.01")
-    stop = asyncio.Event()
-    attempts = 0
-    async def probe():
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise OSError("database restarting")
-        if attempts == 3:
-            assert heartbeat.exists()
-            stop.set()
-    monkeypatch.setattr(worker, "check_database", probe)
-    await asyncio.wait_for(worker.run(stop), timeout=2)
-    assert attempts == 3
-    assert not heartbeat.exists()

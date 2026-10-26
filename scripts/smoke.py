@@ -2,12 +2,8 @@
 """Live stack checks. Standard library only; run from any directory."""
 import argparse
 import json
-from pathlib import Path
-import subprocess
 import time
 from urllib.request import urlopen
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def get(port, path="/", as_json=True):
@@ -17,18 +13,15 @@ def get(port, path="/", as_json=True):
 
 
 def check(ollama_mode, operator_port):
-    for port, name in enumerate(("gateway", "agent", "orders", "refunds", "approvals"), 8000):
-        assert get(port, "/health") == {"service": name, "status": "healthy"}, name
+    assert get(8000, "/health") == {"service": "backend", "status": "healthy"}
     status = get(8000, "/api/system/status")
     assert status["status"] == "healthy", status
-    assert set(status["services"]) == {"agent", "orders", "refunds", "approvals"}
-    assert all(item["reachable"] for item in status["services"].values()), status
-    assert get(8001, "/ready")["database"] == "connected"
-    # The heartbeat is written only after SELECT 1 in the actual worker loop.
-    subprocess.run(["docker", "compose", "exec", "-T", "worker", "python", "-m", "app.healthcheck"], cwd=ROOT, check=True, capture_output=True, timeout=15)
+    assert status["database"] == "connected", status
+    assert get(8000, "/ready")["database"] == "connected"
     for port, title in [(3000, "AI Store Support"), (operator_port, "Support Operator Console")]:
         assert title in get(port, as_json=False), title
-    ollama = get(8001, "/integrations/ollama/health")
+    ollama = get(8000, "/integrations/ollama/health")
+    assert set(status["ollama"]) == set(ollama)
     assert isinstance(ollama["reachable"], bool)
     assert isinstance(ollama["available_models"], list)
     assert ollama["model_installed"] == (ollama["configured_model"] in ollama["available_models"])
@@ -51,7 +44,7 @@ def main():
     while True:
         try:
             ollama = check(args.ollama, args.operator_port)
-            print("PASS: five APIs, gateway dependencies, agent DB, worker heartbeat, both frontends")
+            print("PASS: backend API, database readiness, system diagnostics, both frontends")
             print("PASS: Ollama report:", json.dumps(ollama))
             return
         except Exception as exc:
