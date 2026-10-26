@@ -1,0 +1,140 @@
+name: ai-support-agent
+
+x-python: &python
+  restart: unless-stopped
+  environment: &python-env
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-support}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-support_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-support}
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - ./services/gateway/app:/workspace/services/gateway/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+    environment:
+      <<: *python-env
+      AGENT_BASE_URL: ${AGENT_BASE_URL:-http://agent:8000}
+      ORDERS_BASE_URL: ${ORDERS_BASE_URL:-http://orders:8000}
+      REFUNDS_BASE_URL: ${REFUNDS_BASE_URL:-http://refunds:8000}
+      APPROVALS_BASE_URL: ${APPROVALS_BASE_URL:-http://approvals:8000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001}
+
+  agent:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/agent/Dockerfile
+    ports: ["127.0.0.1:8001:8000"]
+    volumes:
+      - ./services/agent/app:/workspace/services/agent/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+    environment:
+      <<: *python-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql://support:support_dev_password@postgres:5432/support}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  orders:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/orders/Dockerfile
+    ports: ["127.0.0.1:8002:8000"]
+    volumes:
+      - ./services/orders/app:/workspace/services/orders/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+
+  refunds:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/refunds/Dockerfile
+    ports: ["127.0.0.1:8003:8000"]
+    volumes:
+      - ./services/refunds/app:/workspace/services/refunds/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+
+  approvals:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/approvals/Dockerfile
+    ports: ["127.0.0.1:8004:8000"]
+    volumes:
+      - ./services/approvals/app:/workspace/services/approvals/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+
+  worker:
+    <<: *python
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    volumes:
+      - ./services/worker/app:/workspace/services/worker/app
+      - ./packages/python-common/src:/workspace/packages/python-common/src
+    environment:
+      <<: *python-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql://support:support_dev_password@postgres:5432/support}
+      WORKER_CHECK_INTERVAL: ${WORKER_CHECK_INTERVAL:-5}
+    stop_grace_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  customer-web:
+    build:
+      context: .
+      dockerfile: apps/customer-web/Dockerfile
+    restart: unless-stopped
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      VITE_GATEWAY_URL: ${VITE_GATEWAY_URL:-http://localhost:8000}
+    volumes:
+      - ./apps/customer-web/src:/app/src
+      - ./apps/customer-web/index.html:/app/index.html
+      - ./apps/customer-web/vite.config.ts:/app/vite.config.ts
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  operator-web:
+    build:
+      context: .
+      dockerfile: apps/operator-web/Dockerfile
+    restart: unless-stopped
+    ports: ["127.0.0.1:${OPERATOR_WEB_PORT:-3001}:3001"]
+    environment:
+      VITE_GATEWAY_URL: ${VITE_GATEWAY_URL:-http://localhost:8000}
+    volumes:
+      - ./apps/operator-web/src:/app/src
+      - ./apps/operator-web/index.html:/app/index.html
+      - ./apps/operator-web/vite.config.ts:/app/vite.config.ts
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

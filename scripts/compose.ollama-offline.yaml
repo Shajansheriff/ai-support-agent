@@ -1,0 +1,5 @@
+# Merge with compose.yaml to prove that Ollama is not a startup dependency.
+services:
+  agent:
+    environment:
+      OLLAMA_BASE_URL: http://127.0.0.1:1

@@ -1,0 +1,20 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #19352f; background: #f3f6f3; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 880px; margin: auto; padding: 64px 24px; }
+h1 { font-size: clamp(1.9rem, 5vw, 2.7rem); letter-spacing: -.04em; margin: 12px 0 20px; }
+h2 { font-size: 1.15rem; margin: 0; }
+.eyebrow { font-size: .7rem; font-weight: 700; letter-spacing: .15em; }
+.connection { display: inline-block; border-radius: 20px; padding: 8px 14px; background: #e2e8e5; font-size: .85rem; }
+.connected { background: #d3eddd; color: #145b35; }
+.disconnected { background: #ffe2d7; color: #833715; }
+section { background: white; padding: 28px; margin-top: 25px; border: 1px solid #dbe3de; border-radius: 16px; }
+.placeholder { min-height: 240px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; color: #586b63; }
+.placeholder span { font-size: 3rem; color: #668879; }
+label { display: block; font-size: .8rem; margin-bottom: 8px; }
+.composer { display: flex; gap: 12px; }
+input { min-width: 0; flex: 1; border: 1px solid #cbd6cf; padding: 14px; border-radius: 8px; }
+button { border: 0; border-radius: 8px; padding: 14px 22px; background: #dbe5df; color: #53665b; }
+.note, footer { font-size: .85rem; color: #586b63; }
+footer { margin-top: 28px; }
+@media (max-width: 480px) { main { padding: 32px 16px; } section { padding: 20px; } }
